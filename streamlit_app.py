@@ -11,31 +11,32 @@ from playwright_stealth import Stealth
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
-# --- 1. ROBUST ENVIRONMENT SYNC ---
-def ensure_playwright_installed():
-    """Forces installation of binaries if not present or mismatched."""
-    try:
-        # Check if chromium is already available in the expected path
-        import playwright
-        # Attempt to get the version to ensure sync
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=True)
-    except Exception as e:
-        st.error(f"Critical: Browser environment setup failed: {e}")
+# --- 1. ENVIRONMENT SYNC (Cloud Friendly) ---
+def ensure_playwright_binaries():
+    """Installs only the browser binaries. System deps are handled by packages.txt"""
+    # Standard location for playwright browsers on Streamlit Cloud
+    playwright_path = os.path.expanduser("~/.cache/ms-playwright")
+    if not os.path.exists(playwright_path):
+        try:
+            with st.spinner("🚀 Initializing Browser Engine..."):
+                # Install only the chromium binary, no sudo-level deps
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        except Exception as e:
+            st.error(f"Browser Binary Sync Failed: {e}")
 
-# Run this at the very start of the app
-if 'playwright_ready' not in st.session_state:
-    with st.spinner("Preparing secure audit environment..."):
-        ensure_playwright_installed()
-        st.session_state.playwright_ready = True
+# Trigger once per session
+if 'browser_init' not in st.session_state:
+    ensure_playwright_binaries()
+    st.session_state.browser_init = True
 
 nest_asyncio.apply()
 load_dotenv()
 
-# --- 2. AUDIT MANAGER (Component B) ---
+# --- 2. AUDIT LOGIC (Component B) ---
 class AuditManager:
     def __init__(self):
         try:
+            # Connect using Secrets (Upstash/Cloud Redis recommended)
             self.r = redis.Redis(
                 host=st.secrets.get("REDIS_HOST", "localhost"),
                 port=int(st.secrets.get("REDIS_PORT", 6379)),
@@ -44,21 +45,21 @@ class AuditManager:
             )
             self.llm = ChatOpenAI(model="gpt-4o", api_key=st.secrets.get("OPENAI_API_KEY"))
         except Exception as e:
-            st.error("Redis/OpenAI Init Error. Check Secrets.")
+            st.error("Infrastructure Error: Check Redis/OpenAI Secrets.")
 
     def is_visited(self, url):
         return self.r.sismember("audit:visited", url)
 
-    async def analyze_page(self, html):
-        prompt = "Does this HTML contain payment fields/iframes? Reply 'MATCH' or 'SAFE'.\n\n" + html[:2000]
+    async def analyze_content(self, html):
+        prompt = "Identify if this HTML contains CC forms or payment iframes. Reply 'MATCH' or 'SAFE'.\n\n" + html[:2000]
         res = await self.llm.ainvoke(prompt)
         return "MATCH" in res.content.upper()
 
-# --- 3. AUDIT ENGINE (Component A) ---
+# --- 3. CRAWLER ENGINE (Component A) ---
 async def run_pci_audit(target_url, manager):
     async with async_playwright() as p:
-        # ULTIMATE CLOUD LAUNCH FLAGS
         try:
+            # Launch arguments optimized for limited-resource containers
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
@@ -66,8 +67,7 @@ async def run_pci_audit(target_url, manager):
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--no-zygote", # Reduces process count
-                    "--single-process", # Crucial for memory-limited containers
+                    "--single-process"
                 ]
             )
             context = await browser.new_context(user_agent="PCI-Auditor/1.0")
@@ -75,34 +75,46 @@ async def run_pci_audit(target_url, manager):
             await Stealth().apply_stealth_async(page)
 
             queue = [(target_url, 0)]
+            visited_count = 0
+
             while queue:
                 url, depth = queue.pop(0)
-                if manager.is_visited(url) or depth > 2: continue
+                if manager.is_visited(url) or depth > 2:
+                    continue
 
-                st.info(f"Auditing: {url} (Depth {depth})")
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                st.write(f"🔎 Auditing: {url} (Depth {depth})")
                 
-                content = await page.content()
-                if await manager.analyze_page(content):
-                    st.error(f"💳 PCI Finding: {url}")
-                    manager.r.rpush("audit:findings", json.dumps({"url": url, "depth": depth}))
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    content = await page.content()
+                    
+                    if await manager.analyze_content(content):
+                        st.error(f"🚨 PCI FINDING: {url}")
+                        manager.r.rpush("audit:findings", json.dumps({"url": url, "depth": depth}))
 
-                manager.r.sadd("audit:visited", url)
-                
-                if depth < 2:
-                    hrefs = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
-                    for href in hrefs:
-                        if href.startswith("http") and target_url in href:
-                            queue.append((href, depth + 1))
-            
+                    manager.r.sadd("audit:visited", url)
+                    visited_count += 1
+
+                    if depth < 2:
+                        # Extract links for next hop
+                        hrefs = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
+                        for h in hrefs:
+                            if h.startswith("http") and target_url in h:
+                                queue.append((h, depth + 1))
+                except Exception as e:
+                    st.warning(f"Skipping {url}: {e}")
+
             await browser.close()
-            st.success("Audit Cycle Completed.")
+            st.success(f"Audit Complete! Processed {visited_count} endpoints.")
         except Exception as e:
-            st.error(f"Browser Execution Error: {e}")
+            st.error(f"Browser Crash: {e}")
 
-# --- 4. UI ---
+# --- 4. DASHBOARD ---
 st.title("🛡️ PCI Audit Agent")
-root_url = st.text_input("Target URL", "https://example.com")
-if st.button("Start"):
-    manager = AuditManager()
-    asyncio.run(run_pci_audit(root_url, manager))
+url_input = st.text_input("Root Domain", "https://example.com")
+
+if st.button("Launch Audit Phase"):
+    if not st.secrets.get("OPENAI_API_KEY"):
+        st.error("API Key missing in Secrets!")
+    else:
+        asyncio.run(run_pci_audit(url_input, AuditManager()))
