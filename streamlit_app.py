@@ -13,11 +13,13 @@ from dotenv import load_dotenv
 # --- 1. CLOUD ENVIRONMENT SELF-HEALING ---
 # This block ensures Chromium and its Linux dependencies are ready on the Streamlit server
 def ensure_playwright_installed():
+    # Force check for the playwright folder
     if not os.path.exists("/home/appuser/.cache/ms-playwright"):
         try:
-            # Install chromium and system-level dependencies
-            subprocess.run(["playwright", "install", "chromium"], check=True)
-            subprocess.run(["playwright", "install-deps"], check=True)
+            st.info("Initializing browser environment. This may take a minute...")
+            # We add 'install-deps' to handle system-level requirements automatically
+            subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
+            subprocess.run(["python", "-m", "playwright", "install-deps"], check=True)
         except Exception as e:
             st.error(f"Playwright installation failed: {e}")
 
@@ -65,15 +67,16 @@ class AuditManager:
 # --- 3. CRAWLER ENGINE (Component A & C) ---
 async def run_pci_audit(target_url, manager):
     async with async_playwright() as p:
-        # CRITICAL FIX: Cloud-compatible arguments to bypass sandbox restrictions
+        # CRITICAL FIX: Added args to resolve TargetClosedError and Sandbox restrictions
         browser = await p.chromium.launch(
             headless=True, 
-            slow_mo=2000, # Safety requirement: 2s delay
+            slow_mo=1000, # 1s delay for better connection stability on cloud
             args=[
                 "--no-sandbox", 
                 "--disable-setuid-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-gpu"
+                "--disable-dev-shm-usage", # Prevents memory-related browser crashes
+                "--disable-gpu",
+                "--single-process" # Minimizes resource overhead
             ]
         )
         context = await browser.new_context(user_agent="PCI-Auditor-Agent/1.0")
@@ -97,13 +100,13 @@ async def run_pci_audit(target_url, manager):
             status_box.info(f"🔎 **Auditing Depth {depth}:** {url}")
             
             try:
+                # 60s timeout to allow for slow dynamic rendering
                 await page.goto(url, wait_until="networkidle", timeout=60000)
                 
                 # Component C: Human-in-the-Loop Detection (CAPTCHA)
                 content = await page.content()
                 if "captcha" in content.lower() or "verify you are human" in content.lower():
-                    st.warning(f"⚠️ CAPTCHA detected at {url}. Manual intervention (CDP) needed.")
-                    # In local dev, page.pause() would trigger here
+                    st.warning(f"⚠️ CAPTCHA detected at {url}. Intervention needed.")
                 
                 # Discovery logic
                 if await manager.detect_payment_vector(content):
@@ -126,11 +129,11 @@ async def run_pci_audit(target_url, manager):
                 st.error(f"Could not audit {url}: {e}")
 
         await browser.close()
-        st.success(f"Audit Complete. Processed {visited_count} endpoints.")
+        st.success(f"Audit Cycle Complete. Processed {visited_count} endpoints.")
 
 # --- 4. STREAMLIT UI ---
 st.title("🛡️ PCI Payment Page Discovery Agent")
-st.caption("Automated Security Engineering Audit Dashboard")
+st.caption("Automated Security Engineering Audit Tool - CSE III REC")
 
 with st.sidebar:
     st.header("Audit Configuration")
@@ -141,11 +144,11 @@ with st.sidebar:
     if st.button("🗑️ Clear Audit State"):
         m = AuditManager()
         m.r.flushall()
-        st.sidebar.success("Audit state cleared from Redis.")
+        st.sidebar.success("Audit state cleared.")
 
 if run_btn:
     if not st.secrets.get("OPENAI_API_KEY"):
-        st.error("Missing OpenAI API Key in Streamlit Secrets!")
+        st.error("Missing OpenAI API Key! Add it to Streamlit Secrets.")
     else:
         manager = AuditManager()
         asyncio.run(run_pci_audit(root_url, manager))
