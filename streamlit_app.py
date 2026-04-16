@@ -9,6 +9,20 @@ from playwright_stealth import stealth_async
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
+import subprocess
+import os
+
+# Check if playwright is installed; if not, install it
+try:
+    import playwright
+except ImportError:
+    subprocess.run(["pip", "install", "playwright"])
+
+# Ensure Chromium is present in the cloud environment
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    subprocess.run(["playwright", "install", "chromium"])
+    subprocess.run(["playwright", "install-deps"])
+
 # Initialize async support for Streamlit
 nest_asyncio.apply()
 load_dotenv()
