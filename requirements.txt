@@ -1,0 +1,8 @@
+streamlit
+playwright
+playwright-stealth
+redis
+langchain-openai
+python-dotenv
+python-docx
+nest_asyncio
