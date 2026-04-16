@@ -4,114 +4,129 @@ import nest_asyncio
 import redis
 import json
 import os
+import subprocess
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth 
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
-import subprocess
-import os
+# --- 1. CLOUD ENVIRONMENT SETUP ---
+# Required to install Chromium binaries on Streamlit Cloud servers
+def ensure_playwright():
+    if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+        try:
+            subprocess.run(["playwright", "install", "chromium"], check=True)
+            subprocess.run(["playwright", "install-deps"], check=True)
+        except Exception as e:
+            st.error(f"Failed to install browser dependencies: {e}")
 
-# Check if playwright is installed; if not, install it
-try:
-    import playwright
-except ImportError:
-    subprocess.run(["pip", "install", "playwright"])
-
-# Ensure Chromium is present in the cloud environment
-if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    subprocess.run(["playwright", "install", "chromium"])
-    subprocess.run(["playwright", "install-deps"])
-
-# Initialize async support for Streamlit
+ensure_playwright()
 nest_asyncio.apply()
 load_dotenv()
 
-# --- CONFIGURATION & STATE (Component B) ---
-st.set_page_config(page_title="PCI Audit Agent", layout="wide")
+# --- 2. RESOURCE INITIALIZATION ---
+st.set_page_config(page_title="PCI Audit Agent", layout="wide", page_icon="🛡️")
 
 class AuditManager:
     def __init__(self):
-        # Redis handles "State Recoverability" [cite: 71, 75]
-        self.r = redis.Redis(host='localhost', port=6379, decode_responses=True)
-        self.llm = ChatOpenAI(model="gpt-4o")
+        # Use st.secrets for Cloud or local environment variables
+        self.r = redis.Redis(
+            host=st.secrets.get("REDIS_HOST", "localhost"),
+            port=int(st.secrets.get("REDIS_PORT", 6379)),
+            password=st.secrets.get("REDIS_PASSWORD", None),
+            decode_responses=True
+        )
+        self.llm = ChatOpenAI(model="gpt-4o", api_key=st.secrets.get("OPENAI_API_KEY"))
 
     def is_visited(self, url):
         return self.r.sismember("audit:visited", url)
 
-    def log_finding(self, url, depth, screenshot):
-        finding = json.dumps({"url": url, "depth": depth, "screenshot": screenshot})
-        self.r.rpush("audit:findings", finding) # Component B: Auditability Log [cite: 76]
-
     async def detect_payment_vector(self, html):
-        # Component A: Payment Page Detection [cite: 54, 101]
-        prompt = f"Analyze for CC fields, Stripe/PayPal iframes, or checkout modals. Reply 'MATCH' or 'SAFE':\n\n{html[:1500]}"
+        # Intelligent Reasoning for Payment Entry Points
+        prompt = (
+            "Analyze the following HTML. Identify if it contains credit card fields, "
+            "payment iframes (Stripe/PayPal), or checkout forms. "
+            "Reply 'MATCH' or 'SAFE' only.\n\n" + html[:2000]
+        )
         response = await self.llm.ainvoke(prompt)
         return "MATCH" in response.content.upper()
 
-# --- CRAWLER ENGINE (Component A) ---
-async def run_audit_cycle(target_url, manager):
-    async with async_playwright() as p:
-        # Component A: Headless browser with throttling [cite: 62, 63]
-        browser = await p.chromium.launch(headless=True, slow_mo=2000) 
-        context = await browser.new_context(user_agent="PCI-Auditor/1.0")
-        page = await context.new_page()
-        await stealth_async(page)
+    def log_finding(self, url, depth, vector_type):
+        finding = json.dumps({"url": url, "depth": depth, "vector": vector_type})
+        self.r.rpush("audit:findings", finding)
 
-        queue = [(target_url, 0)] # (URL, Hop Depth)
+# --- 3. CRAWLER ENGINE ---
+async def run_pci_audit(target_url, manager):
+    async with async_playwright() as p:
+        # slow_mo=2000 enforces the 2-5s safety throttling requirement
+        browser = await p.chromium.launch(headless=True, slow_mo=2000)
+        context = await browser.new_context(user_agent="PCI-Auditor-Agent/1.0")
+        page = await context.new_page()
         
+        # Apply updated Stealth API
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
+
+        queue = [(target_url, 0)] # (URL, Depth)
+        visited_count = 0
+        
+        status_box = st.empty()
+        findings_area = st.container()
+
         while queue:
             url, depth = queue.pop(0)
-            if manager.is_visited(url) or depth > 2: continue # Enforce 2-hop limit [cite: 33, 115]
+            if manager.is_visited(url) or depth > 2:
+                continue
 
-            st.write(f"🔍 **Auditing Depth {depth}:** {url}")
+            status_box.info(f"🔎 Auditing Depth {depth}: {url}")
             
             try:
                 await page.goto(url, wait_until="networkidle", timeout=60000)
                 
-                # Component D: CAPTCHA/Auth Detection [cite: 80, 91]
+                # Check for Human-in-the-Loop Gates (CAPTCHA)
                 content = await page.content()
                 if "captcha" in content.lower():
-                    st.warning(f"⚠️ CAPTCHA detected at {url}. CDP Handoff required.")
-                    await page.pause() # Manual intervention gate [cite: 95]
-
-                # Identify findings
+                    st.warning(f"⚠️ CAPTCHA detected at {url}. Manual intervention required.")
+                    # In a local environment, page.pause() would trigger here
+                
+                # Payment Discovery
                 if await manager.detect_payment_vector(content):
-                    path = f"screenshots/finding_{depth}_{hash(url)}.png"
-                    await page.screenshot(path=path) # Component A: Evidence capture [cite: 65]
-                    manager.log_finding(url, depth, path)
-                    st.error(f"💳 Payment Vector Flagged: {url}")
+                    manager.log_finding(url, depth, "Form/Iframe Detected")
+                    findings_area.error(f"💳 **Payment Vector Found:** {url} (Depth {depth})")
 
                 manager.r.sadd("audit:visited", url)
+                visited_count += 1
 
-                # Link Extraction for Depth 1 & 2 [cite: 24, 29]
+                # Extract links for hops (Component A)
                 if depth < 2:
-                    links = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
-                    for link in links:
-                        if link.startswith("http"):
-                            is_ext = target_url not in link
-                            new_depth = depth + 1 if is_ext else depth
-                            queue.append((link, new_depth))
+                    hrefs = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
+                    for href in hrefs:
+                        if href.startswith("http"):
+                            # Determine if this is a new domain hop
+                            is_external = target_url not in href
+                            new_depth = depth + 1 if is_external else depth
+                            queue.append((href, new_depth))
+
             except Exception as e:
-                st.error(f"Error on {url}: {e}")
+                st.error(f"Could not audit {url}: {e}")
 
         await browser.close()
+        st.success(f"Audit Complete. Processed {visited_count} URLs.")
 
-# --- STREAMLIT UI ---
-st.title("🛡️ PCI Payment Discovery & Audit Agent")
-st.markdown("### Securin Security Engineering Assessment")
+# --- 4. STREAMLIT UI ---
+st.title("🛡️ PCI Payment Discovery Agent")
+st.caption("Automated Security Engineering Audit Tool")
 
-target = st.text_input("Enter Root Domain URL", "https://example.com")
-col1, col2 = st.columns(2)
+with st.sidebar:
+    st.header("Settings")
+    root_url = st.text_input("Root Domain", "https://example.com")
+    run_btn = st.button("🚀 Start Audit")
+    
+    if st.button("🗑️ Clear Redis State"):
+        m = AuditManager()
+        m.r.flushall()
+        st.sidebar.success("State Cleared.")
 
-if col1.button("🚀 Start Audit Phase"):
-    # Enforce Phase-Based Gate Checks [cite: 70]
-    if not os.path.exists("screenshots"): os.makedirs("screenshots")
+if run_btn:
     manager = AuditManager()
-    asyncio.run(run_audit_cycle(target, manager))
-    st.success("Audit Completed. Phase Gate: Report Generation Ready.")
-
-if col2.button("📋 Clear Audit State"):
-    r = redis.Redis(host='localhost', port=6379)
-    r.flushall()
-    st.info("Redis State Cleared.")
+    asyncio.run(run_pci_audit(root_url, manager))
