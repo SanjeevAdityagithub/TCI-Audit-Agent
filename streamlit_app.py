@@ -10,39 +10,46 @@ from playwright_stealth import Stealth
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
-# --- 1. CLOUD ENVIRONMENT SETUP ---
-# Required to install Chromium binaries on Streamlit Cloud servers
-def ensure_playwright():
+# --- 1. CLOUD ENVIRONMENT SELF-HEALING ---
+# This block ensures Chromium and its Linux dependencies are ready on the Streamlit server
+def ensure_playwright_installed():
     if not os.path.exists("/home/appuser/.cache/ms-playwright"):
         try:
+            # Install chromium and system-level dependencies
             subprocess.run(["playwright", "install", "chromium"], check=True)
             subprocess.run(["playwright", "install-deps"], check=True)
         except Exception as e:
-            st.error(f"Failed to install browser dependencies: {e}")
+            st.error(f"Playwright installation failed: {e}")
 
-ensure_playwright()
+ensure_playwright_installed()
 nest_asyncio.apply()
 load_dotenv()
 
-# --- 2. RESOURCE INITIALIZATION ---
+# --- 2. RESOURCE INITIALIZATION (Component B) ---
 st.set_page_config(page_title="PCI Audit Agent", layout="wide", page_icon="🛡️")
 
 class AuditManager:
     def __init__(self):
-        # Use st.secrets for Cloud or local environment variables
-        self.r = redis.Redis(
-            host=st.secrets.get("REDIS_HOST", "localhost"),
-            port=int(st.secrets.get("REDIS_PORT", 6379)),
-            password=st.secrets.get("REDIS_PASSWORD", None),
-            decode_responses=True
-        )
-        self.llm = ChatOpenAI(model="gpt-4o", api_key=st.secrets.get("OPENAI_API_KEY"))
+        # Configuration pulled from Streamlit Cloud Secrets (TOML)
+        try:
+            self.r = redis.Redis(
+                host=st.secrets.get("REDIS_HOST", "localhost"),
+                port=int(st.secrets.get("REDIS_PORT", 6379)),
+                password=st.secrets.get("REDIS_PASSWORD", None),
+                decode_responses=True
+            )
+            self.llm = ChatOpenAI(
+                model="gpt-4o", 
+                api_key=st.secrets.get("OPENAI_API_KEY")
+            )
+        except Exception as e:
+            st.error(f"Initialization Error: {e}. Check your Streamlit Secrets.")
 
     def is_visited(self, url):
         return self.r.sismember("audit:visited", url)
 
     async def detect_payment_vector(self, html):
-        # Intelligent Reasoning for Payment Entry Points
+        # Component A: Intelligent Reasoning for Payment Entry Points
         prompt = (
             "Analyze the following HTML. Identify if it contains credit card fields, "
             "payment iframes (Stripe/PayPal), or checkout forms. "
@@ -55,11 +62,20 @@ class AuditManager:
         finding = json.dumps({"url": url, "depth": depth, "vector": vector_type})
         self.r.rpush("audit:findings", finding)
 
-# --- 3. CRAWLER ENGINE ---
+# --- 3. CRAWLER ENGINE (Component A & C) ---
 async def run_pci_audit(target_url, manager):
     async with async_playwright() as p:
-        # slow_mo=2000 enforces the 2-5s safety throttling requirement
-        browser = await p.chromium.launch(headless=True, slow_mo=2000)
+        # CRITICAL FIX: Cloud-compatible arguments to bypass sandbox restrictions
+        browser = await p.chromium.launch(
+            headless=True, 
+            slow_mo=2000, # Safety requirement: 2s delay
+            args=[
+                "--no-sandbox", 
+                "--disable-setuid-sandbox", 
+                "--disable-dev-shm-usage", 
+                "--disable-gpu"
+            ]
+        )
         context = await browser.new_context(user_agent="PCI-Auditor-Agent/1.0")
         page = await context.new_page()
         
@@ -75,24 +91,24 @@ async def run_pci_audit(target_url, manager):
 
         while queue:
             url, depth = queue.pop(0)
-            if manager.is_visited(url) or depth > 2:
+            if manager.is_visited(url) or depth > 2: # Domain Hop Hard Stop
                 continue
 
-            status_box.info(f"🔎 Auditing Depth {depth}: {url}")
+            status_box.info(f"🔎 **Auditing Depth {depth}:** {url}")
             
             try:
                 await page.goto(url, wait_until="networkidle", timeout=60000)
                 
-                # Check for Human-in-the-Loop Gates (CAPTCHA)
+                # Component C: Human-in-the-Loop Detection (CAPTCHA)
                 content = await page.content()
-                if "captcha" in content.lower():
-                    st.warning(f"⚠️ CAPTCHA detected at {url}. Manual intervention required.")
-                    # In a local environment, page.pause() would trigger here
+                if "captcha" in content.lower() or "verify you are human" in content.lower():
+                    st.warning(f"⚠️ CAPTCHA detected at {url}. Manual intervention (CDP) needed.")
+                    # In local dev, page.pause() would trigger here
                 
-                # Payment Discovery
+                # Discovery logic
                 if await manager.detect_payment_vector(content):
-                    manager.log_finding(url, depth, "Form/Iframe Detected")
-                    findings_area.error(f"💳 **Payment Vector Found:** {url} (Depth {depth})")
+                    manager.log_finding(url, depth, "PCI Vector Flagged")
+                    findings_area.error(f"💳 **Payment Entry Point Found:** {url} (Depth {depth})")
 
                 manager.r.sadd("audit:visited", url)
                 visited_count += 1
@@ -102,7 +118,6 @@ async def run_pci_audit(target_url, manager):
                     hrefs = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
                     for href in hrefs:
                         if href.startswith("http"):
-                            # Determine if this is a new domain hop
                             is_external = target_url not in href
                             new_depth = depth + 1 if is_external else depth
                             queue.append((href, new_depth))
@@ -111,22 +126,26 @@ async def run_pci_audit(target_url, manager):
                 st.error(f"Could not audit {url}: {e}")
 
         await browser.close()
-        st.success(f"Audit Complete. Processed {visited_count} URLs.")
+        st.success(f"Audit Complete. Processed {visited_count} endpoints.")
 
 # --- 4. STREAMLIT UI ---
-st.title("🛡️ PCI Payment Discovery Agent")
-st.caption("Automated Security Engineering Audit Tool")
+st.title("🛡️ PCI Payment Page Discovery Agent")
+st.caption("Automated Security Engineering Audit Dashboard")
 
 with st.sidebar:
-    st.header("Settings")
-    root_url = st.text_input("Root Domain", "https://example.com")
+    st.header("Audit Configuration")
+    root_url = st.text_input("Root Domain URL", "https://example.com")
     run_btn = st.button("🚀 Start Audit")
     
-    if st.button("🗑️ Clear Redis State"):
+    st.divider()
+    if st.button("🗑️ Clear Audit State"):
         m = AuditManager()
         m.r.flushall()
-        st.sidebar.success("State Cleared.")
+        st.sidebar.success("Audit state cleared from Redis.")
 
 if run_btn:
-    manager = AuditManager()
-    asyncio.run(run_pci_audit(root_url, manager))
+    if not st.secrets.get("OPENAI_API_KEY"):
+        st.error("Missing OpenAI API Key in Streamlit Secrets!")
+    else:
+        manager = AuditManager()
+        asyncio.run(run_pci_audit(root_url, manager))
